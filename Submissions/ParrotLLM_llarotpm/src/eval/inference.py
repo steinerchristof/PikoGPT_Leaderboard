@@ -264,6 +264,9 @@ def _score_logits(
     return total, n
 
 
+_SHORT_OPTION_TOKEN_THRESHOLD = 12
+
+
 @torch.no_grad()
 def score_mc_options(
     model: torch.nn.Module,
@@ -301,6 +304,21 @@ def score_mc_options(
             scores[letter] = sum_lp / n if n > 0 else float("-inf")
         return scores
 
+    opt_token_counts = []
+    for opt_text in options.values():
+        opt_text = opt_text.strip()
+        if not opt_text:
+            continue
+        # Encode with the same leading-space the scorer uses so the count
+        # matches what _score_logits actually scores.
+        ids = tokenizer.encode(" " + opt_text, add_special_tokens=False)
+        opt_token_counts.append(len(ids))
+    if opt_token_counts:
+        avg_opt_tokens = sum(opt_token_counts) / len(opt_token_counts)
+    else:
+        avg_opt_tokens = 0
+    length_normalize = avg_opt_tokens > _SHORT_OPTION_TOKEN_THRESHOLD
+
     for letter, opt_text in options.items():
         opt_text = opt_text.strip()
         if not opt_text:
@@ -308,14 +326,18 @@ def score_mc_options(
             continue
         sum_lp, n = _score_logits(model, tokenizer, stem, " " + opt_text,
                                    device, context_length)
-        score = sum_lp / n if n > 0 else float("-inf")
-        if use_pmi and n > 0:
+        if n == 0:
+            scores[letter] = float("-inf")
+            continue
+        score = sum_lp / n if length_normalize else sum_lp
+        if use_pmi:
             base_lp, base_n = _score_logits(
                 model, tokenizer, "Answer:", " " + opt_text,
                 device, context_length,
             )
-            base = base_lp / base_n if base_n > 0 else 0.0
-            score = score - base
+            if base_n > 0:
+                base = base_lp / base_n if length_normalize else base_lp
+                score = score - base
         scores[letter] = score
     return scores
 
