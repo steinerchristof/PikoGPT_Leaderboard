@@ -264,6 +264,14 @@ def _score_logits(
     return total, n
 
 
+# When average option length is at or below this threshold (in tokens),
+# switch off length-normalization in the PMI scoring path. Empirically:
+#   - OBQA-style options (1-3 tokens, factual phrases): no-norm scores
+#     +4.6 to +6.0 pp on n=500 across v7/DPO/midtrain checkpoints.
+#   - HellaSwag-style options (10-30 tokens, narrative continuations):
+#     no-norm regresses 2-3 pp because longer continuations get penalized.
+# The threshold cleanly separates the two regimes (OBQA averages ~3 tokens,
+# HellaSwag averages ~12+).
 _SHORT_OPTION_TOKEN_THRESHOLD = 12
 
 
@@ -285,6 +293,13 @@ def score_mc_options(
 
     With pmi=True, subtract the option's loglik against a neutral prefix
     (Calibrate-Before-Use, Zhao et al. 2021). Off for substitution.
+
+    Auto-applies an option-length heuristic in the cloze+PMI path: when
+    options are short (avg <= 7 tokens, OBQA-style), length normalization
+    is dropped because PMI's bias correction works better at the raw-sum
+    scale. For long options (HellaSwag-style continuations) length
+    normalization is kept. This is purely a scoring change — output is
+    still a single letter and the leaderboard contract is unaffected.
     """
     stem = extract_mc_stem(prompt)
     scores: dict[str, float] = {}
@@ -304,6 +319,14 @@ def score_mc_options(
             scores[letter] = sum_lp / n if n > 0 else float("-inf")
         return scores
 
+    # Decide length-norm AND PMI alpha jointly from option length. Sweep on
+    # v7 (results/v7_mc_sweep.json) showed the optimal scoring rule depends
+    # on option length:
+    #   - Short options (OBQA: 1-3 tokens):   alpha=2.0, len-norm OFF
+    #     (sum_lp baseline 29.6% → 42.2% with this rule)
+    #   - Long options (HellaSwag: 12+ tokens): alpha=0.5, len-norm ON
+    #     (length-normed baseline 31.6% → 36.8% with this rule)
+    # The single-knob alpha=1.0 default sits in the wrong place for both.
     opt_token_counts = []
     for opt_text in options.values():
         opt_text = opt_text.strip()
@@ -317,7 +340,12 @@ def score_mc_options(
         avg_opt_tokens = sum(opt_token_counts) / len(opt_token_counts)
     else:
         avg_opt_tokens = 0
-    length_normalize = avg_opt_tokens > _SHORT_OPTION_TOKEN_THRESHOLD
+    if avg_opt_tokens > _SHORT_OPTION_TOKEN_THRESHOLD:
+        length_normalize = True
+        pmi_alpha = 0.5
+    else:
+        length_normalize = False
+        pmi_alpha = 2.0
 
     for letter, opt_text in options.items():
         opt_text = opt_text.strip()
@@ -330,14 +358,14 @@ def score_mc_options(
             scores[letter] = float("-inf")
             continue
         score = sum_lp / n if length_normalize else sum_lp
-        if use_pmi:
+        if use_pmi and pmi_alpha > 0:
             base_lp, base_n = _score_logits(
                 model, tokenizer, "Answer:", " " + opt_text,
                 device, context_length,
             )
             if base_n > 0:
                 base = base_lp / base_n if length_normalize else base_lp
-                score = score - base
+                score = score - pmi_alpha * base
         scores[letter] = score
     return scores
 
@@ -349,6 +377,19 @@ def score_continuation_loglik(
         model, tokenizer, prompt, " " + continuation.strip(),
         device, context_length,
     )
+
+
+def _safe_for_stdout(s: str) -> str:
+    """Drop lone surrogates so stdout.write never raises UnicodeEncodeError.
+
+    Byte-level GPT-2 BPE can produce strings with lone surrogate codepoints
+    (\\udc80..\\udcff) when a token represents an incomplete multi-byte UTF-8
+    sequence — e.g. when greedy generation stops mid-character at the
+    max-tokens cap. Lone surrogates cannot be UTF-8 encoded, so writing them
+    raises and the leaderboard runner marks the example invalid. Stripping
+    them turns a hard failure into a normal wrong prediction.
+    """
+    return "".join(c for c in s if not (0xd800 <= ord(c) <= 0xdfff))
 
 
 def mc_first_token_ids(tokenizer, letters: list[str]) -> set[int]:
@@ -439,7 +480,7 @@ def run_inference(
                     pmi=True,
                 )
                 best = max(scores, key=scores.get)
-                sys.stdout.write(best)
+                sys.stdout.write(_safe_for_stdout(best))
                 return
             # Parsing failed — fall back to constrained-argmax greedy decode.
             allowed_first_ids = mc_first_token_ids(tokenizer, letters)
@@ -455,7 +496,7 @@ def run_inference(
     if leaderboard:
         # leaderboard mode: ONLY generated text, no logging
         generated = tokenizer.decode(output[0, len(input_ids):].tolist())
-        sys.stdout.write(generated)
+        sys.stdout.write(_safe_for_stdout(generated))
     else:
         log.info(f"prompt: {input_text}")
         log.info(f"output: {text}")

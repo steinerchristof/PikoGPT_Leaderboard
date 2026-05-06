@@ -7,8 +7,8 @@
 # Run from inside Submissions/ParrotLLM/.
 
 set -e
-URL="https://github.com/steinerchristof/PikoGPT_Leaderboard/releases/download/parrotllm-may05/final_step_0000877_epoch_00_valloss_2p4576.pt"
-DEST="runs/final_step_0000877_epoch_00_valloss_2p4576.pt"
+URL="https://github.com/steinerchristof/PikoGPT_Leaderboard/releases/download/parrotllm-v7/final_step_0001966_epoch_01_valloss_2p4231.pt"
+DEST="runs/final_step_0001966_epoch_01_valloss_2p4231.pt"
 
 mkdir -p runs
 echo "downloading to $DEST..."
